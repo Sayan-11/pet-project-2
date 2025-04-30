@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from enum  import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, TypedDict, Union
+from bs4 import BeautifulSoup, NavigableString,Tag
 
 import undetected_chromedriver as uc
 from selenium.webdriver            import Chrome
@@ -167,14 +168,44 @@ def _get_difficulty(d:Chrome):
     try: return d.find_element(By.CLASS_NAME,"tag_css_link").text.strip()
     except: return ""
 
-def _get_answers(d:Chrome):
-    out=[]
-    for ab in d.find_elements(By.CLASS_NAME,"answer-block"):
-        try: ab.find_element(By.CLASS_NAME,"btn-show-answer").click(); time.sleep(0.5)
-        except: pass
-        try: out.append(ab.find_element(By.CLASS_NAME,"downRow").text.strip())
-        except: out.append("")
-    return out
+# --- put near the other regex helpers ---------------------------------
+_OA_RE = re.compile(
+    r"""\b          # word-boundary
+        (?:OA|Answer|Correct)   # usual keywords
+        [\s\:\-\–]*             # :, -, – or just spaces
+        ([A-E])                 # capture A … E
+        \b""",
+    re.I | re.X,
+)
+
+def _first_choice(txt: str) -> str:
+    """
+    Extract the FIRST A-E choice from a spoiler block.
+    Falls back to the first stand-alone capital A-E if no keyword present.
+    """
+    m = _OA_RE.search(txt)
+    if not m:
+        # fall-back: any isolated capital A-E
+        m = re.search(r"\b([A-E])\b", txt)
+    return m.group(1).upper() if m else ""
+
+
+
+def _get_answers(d: Chrome) -> List[str]:
+    answers = []
+    for blk in d.find_elements(By.CLASS_NAME, "answer-block"):
+        try:                                   # open the spoiler
+            blk.find_element(By.CLASS_NAME, "btn-show-answer").click()
+            time.sleep(0.4)
+        except Exception:
+            pass
+        try:
+            raw = blk.find_element(By.CLASS_NAME, "downRow").text
+            answers.append(_first_choice(raw))
+        except Exception:
+            answers.append("")
+    return answers
+
 
 def _parse_di_grid(rows, yes_is_first: bool, labels=("Supported",
                                                      "Not Supported")):
@@ -209,6 +240,8 @@ def _parse_binary_grid(tbl) -> List[Dict[str, str]]:
         off = "Yes" if "official_answer" in tds[0].get_attribute("class") else "No"
         out.append({"statement": stmt, "official": off})
     return out
+
+
 
 def _parse_multichoice(tbl) -> Dict[str, Any]:
     choices, official = [], None
@@ -256,6 +289,51 @@ def _split_opts_cr(raw: str):
     choices = parts[1:]
     letters = list("ABCDE")[: len(choices)]
     return stem, {ltr: txt.strip() for ltr, txt in zip(letters, choices)}
+
+
+# ─── RC noise-filter helpers ────────────────────────────────────────
+_RC_NOISE_PAT = re.compile(
+    r"""
+    ^\s*(?:                       # entire line contains ONLY …
+        \d{2}:\d{2} |                #   00:00 timers
+        Show\s+Answer | Hide | Show\s+Spoiler |
+        History | Add\s+Mistake |
+        Difficulty: | Question\s+Stats: |
+        Date | Time | Result | not\s+attempted\s+yet
+    )\s*$""",
+    re.I | re.X
+)
+
+def _strip_rc_noise(block: str) -> str:
+    """Remove GC timer / statistics garbage from a question-stem block."""
+    return "\n".join(
+        ln for ln in block.splitlines() if not _RC_NOISE_PAT.match(ln)
+    ).strip()
+def _remove_timer(html: str) -> str:
+    """Delete every <div id="rc_timer_placeholder_* … </div> block."""
+    # non-greedy so we kill exactly one widget at a time
+    return re.sub(r'<div id="rc_timer_placeholder_.*?</div>\s*</div>', '',
+                  html, flags=re.S|re.I)
+
+_QA_LINE_RE = re.compile(r"\b(\d+)\s*[\.\:\-]?\s*([A-E])\b", re.I)
+
+def _explode_answer_blob(blob: str, n_q: int) -> list[str]:
+    """
+    If `blob` contains several '1. A  2.B' style answers, return them as
+    a list of length `n_q`.  Otherwise return [first_choice(blob)].
+    """
+    found = _QA_LINE_RE.findall(blob)
+    if len(found) >= n_q:                     # looks like a combined list
+        # place by question number (1-based in blob)
+        out = [""] * n_q
+        for num, letter in found:
+            idx = int(num) - 1
+            if 0 <= idx < n_q:
+                out[idx] = letter.upper()
+        return out
+    # fallback – treat blob as a single spoiler (old behaviour)
+    return [_first_choice(blob)]
+
 
 
 # ─── CR parser (fixed) ─────────────────────────────────────────────
@@ -313,49 +391,50 @@ def _parse_ds(d: Chrome) -> DSDict:
 
 # ─── RC parser ─────────────────────────────────────────────────────
 def _parse_rc(d: Chrome) -> RCDict:
-    """
-    Return a dict with: passage, difficulty, questions[ {prompt, options, answer} ]
-    The page always renders the reading-comprehension passage in the first
-    .bbcodeBoxIn and the question block in the second .bbcodeBoxIn – both are
-    direct children of a single .bbcodeBoxOut wrapper.
-    """
-    # 1) make sure the wrapper is present
+    # A. locate the passage + question container
     wrapper = WebDriverWait(d, 20).until(
         EC.presence_of_element_located((By.CLASS_NAME, "bbcodeBoxOut"))
     )
-
-    # 2) pull only the *direct* children so we ignore any nested boxes
     boxes = wrapper.find_elements(By.CSS_SELECTOR, ":scope > .bbcodeBoxIn")
     if len(boxes) < 2:
         raise ScrapeError("RC page did not expose passage + questions")
 
-    passage        = basic_clean(boxes[0].text)
-    questions_blob = boxes[1].text                  # already strips <script> etc.
+    # Passage text
+    passage_text = basic_clean(boxes[0].text)
 
+    # Raw HTML for Q&A block
+    raw_html = boxes[1].get_attribute('innerHTML')
+    # Strip out GMAT Timer placeholders
+    raw_html = re.sub(r'<div id="rc_timer_placeholder_\d+">.*?</div>', '', raw_html, flags=re.DOTALL)
+    soup = BeautifulSoup(raw_html, 'html.parser')
+
+    # Difficulty and official answers
     difficulty = _get_difficulty(d)
-    answers    = _get_answers(d)                    # opens spoilers and collects OA's
+    answers = _get_answers(d)
 
-    # 3) split the big blob into individual questions
-    chunks  = questions_blob.split("Question ")[1:]  # drop the header part
-    qlist: List[RCQuestion] = []
+    # Find question stems and options
+    qlist = []
+    stems = soup.find_all('span', style=lambda v: v and 'font-weight: bold' in v)
+    for idx, stem_tag in enumerate(stems):
+        stem = basic_clean(stem_tag.get_text())
+        opts = {}
+        # Traverse siblings until next stem
+        current = stem_tag.next_sibling
+        while current:
+            # Stop at next bold stem
+            if isinstance(current, Tag) and current.name == 'span' and 'font-weight: bold' in current.get('style', ''):
+                break
+            # Text node containing options
+            if isinstance(current, str) and current.strip():
+                for line in current.splitlines():
+                    m = re.match(r"\(?([A-E])\)?\.?\s*(.+)", line.strip())
+                    if m:
+                        opts[m.group(1)] = m.group(2).strip()
+            current = current.next_sibling
+        oa = answers[idx] if idx < len(answers) else ""
+        qlist.append(RCQuestion(prompt=stem, options=opts, answer=oa))
 
-    for idx, ch in enumerate(chunks):
-        # remove blank lines and the spoiler row
-        lines = [l for l in ch.split("\n") if l.strip()]
-        try:
-            spoiler_idx = next(
-                i for i, l in enumerate(lines) if "Show Spoiler" in l or "Hide Spoiler" in l
-            )
-        except StopIteration:
-            continue  # skip malformed question
-
-        stem_raw   = " ".join(lines[spoiler_idx + 1 :])
-        stem, opts = _split_opts(stem_raw)
-        ans        = answers[idx] if idx < len(answers) else ""
-
-        qlist.append(RCQuestion(prompt=stem, options=opts, answer=ans))
-
-    return RCDict(passage=passage, difficulty=difficulty, questions=qlist)
+    return RCDict(passage=passage_text, difficulty=difficulty, questions=qlist)
 
 # ─── PS parser ──────────────────────────────────────────────────────
 def _parse_ps(d: Chrome) -> DSDict:
