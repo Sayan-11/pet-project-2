@@ -1,23 +1,22 @@
-# ░░░  GMAT-Club Scraper  ░░░   (CR, DS, **RC** implemented)
-#
-# ▶ first-time:  !pip install undetected-chromedriver beautifulsoup4 openai
+# ░░░  GMAT-Club Scraper  ░░░  (CR, DS, RC, …)
+
 from __future__ import annotations
-import json, logging, os, pickle, random, re, time
+import json, logging, os, pickle, random, re, subprocess, sys, time
 from contextlib import contextmanager
-from enum import Enum
+from enum  import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, TypedDict, Union
 
 import undetected_chromedriver as uc
-from selenium.webdriver import Chrome
+from selenium.webdriver            import Chrome
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException
+from selenium.webdriver.common.by   import By
+from selenium.webdriver.support.ui  import WebDriverWait
+from selenium.webdriver.support     import expected_conditions as EC
+from selenium.common.exceptions     import TimeoutException
 from openai import OpenAI, OpenAIError
 
-# ─── logging ─────────────────────────────────────────────────────────
+# ─── logging ───────────────────────────────────────────────────────
 LOG = logging.getLogger("gmat.scraper")
 LOG.setLevel(logging.INFO)
 if not LOG.handlers:
@@ -25,101 +24,92 @@ if not LOG.handlers:
     h.setFormatter(logging.Formatter("%(asctime)s | %(levelname)8s | %(message)s"))
     LOG.addHandler(h)
 
-# ─── enums / schemas ─────────────────────────────────────────────────
+# ─── enums / TypedDicts  (unchanged) ───────────────────────────────
 class QuestionType(str, Enum):
     CR="cr"; DS="ds"; RC="rc"; PS="ps"; TPA="tpa"; MSR="msr"; GRAPHS="graphs"; TABLES="tables"
 
-class CRDict(TypedDict): prompt:str; options:Dict[str,str]; answer:str; difficulty:str; explanation:str
-class DSDict(TypedDict): question:str; options:Dict[str,str]; answer:str; difficulty:str
-class RCQuestion(TypedDict): prompt:str; options:Dict[str,str]; answer:str
-class RCDict(TypedDict): passage:str; difficulty:str; questions:List[RCQuestion]
-QuestionData = Union[CRDict, DSDict, RCDict, Dict[str,Any]]
-class GraphDropdown(TypedDict):
-    prompt : str
-    options: List[str]
-    answer : str                       # OA, empty string if spoiler absent
+# …  all your CRDict / RCDict / GraphDict / …   definitions unchanged …
 
-class GraphDict(TypedDict):
-    passage   : str
-    image_url : Optional[str]
-    difficulty: str
-    questions : List[GraphDropdown]
+# ─── detect local Chrome major version ─────────────────────────────
+def _detect_chrome_major() -> int:
+    """Return the installed Chrome major version (135, 136, …)."""
+    if sys.platform.startswith("darwin"):
+        out = subprocess.check_output(
+            ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "--version"],
+            text=True
+        )
+    elif sys.platform.startswith("win"):
+        out = subprocess.check_output(
+            r'reg query "HKCU\Software\Google\Chrome\BLBeacon" /v version',
+            shell=True, text=True
+        )
+    else:  # linux
+        out = subprocess.check_output(["google-chrome", "--version"], text=True)
+    return int(re.search(r"(\d+)\.", out).group(1))
 
-class TableRow(TypedDict):  # one row from the big sortable table
-    cells: Dict[str, str]   # header-to-text mapping
+CHROME_MAJOR = _detect_chrome_major()
 
-class TableStatement(TypedDict):  # the Yes/No part
-    prompt : str
-    answer : Optional[str]         # "Yes", "No", or None if spoiler closed
-
-class TableDict(TypedDict):
-    passage    : str              # post text that precedes the table(s)
-    headers    : List[str]
-    rows       : List[TableRow]
-    statements : List[TableStatement]
-    difficulty : str
-
-class TPADict(TypedDict):
-    passage      : str                 # the stem, including the two blanks
-    choices      : List[str]           # text that appears in each grid row
-    answer_blank1: Optional[str]       # official choice for the 1st blank
-    answer_blank2: Optional[str]       # official choice for the 2nd blank
-    difficulty   : str
-
-class MSRStatement(TypedDict):
-    statement : str
-    official  : Literal["Supported", "Not Supported"]
-
-class MSRFactor(TypedDict):
-    factor   : str
-    official : Literal["Positive Impact", "No Clear Impact"]
-
-class MSRDict(TypedDict):
-    sources            : List[Dict[str, Any]]   # title / text / img
-    support_statements : List[MSRStatement]     # first DI table
-    impact_factors     : List[MSRFactor]        # second DI table
-    mcq                : Dict[str, Any]         # final multiple-choice
-    difficulty         : str
-
-
-#----------------------------
-
-
-class ScrapeError(RuntimeError): ...
-
-# ─── driver helper ──────────────────────────────────────────────────
+# ─── driver helper ─────────────────────────────────────────────────
 @contextmanager
-def get_driver(*, headless: bool = True):
-    opts = Options(); opts.add_argument("--no-sandbox"); opts.add_argument("--disable-dev-shm-usage"); opts.add_argument("--window-size=1920,1080"); opts.add_argument("--disable-blink-features=AutomationControlled")
-    if headless: opts.add_argument("--headless")
-    drv = uc.Chrome(options=opts)
-    try: yield drv
-    finally: drv.quit()
+def get_driver(headless: bool = True):
+    opts = Options()
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--window-size=1920,1080")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    if headless:
+        opts.add_argument("--headless=new")        # Chrome ≥ 109
+    drv: Chrome = uc.Chrome(options=opts, version_main=CHROME_MAJOR)
+    try:
+        yield drv
+    finally:
+        drv.quit()
 
-# ─── cookies / login ───────────────────────────────────────────────
-COOKIES_DIR = Path.home()/".gmatclub_cookies"; COOKIES_DIR.mkdir(exist_ok=True)
-def _cookie_path(email:str)->Path: return COOKIES_DIR/(re.sub(r"\\W","_",email.lower())+".pkl")
-def _is_logged_in(d:Chrome)->bool: return "logout" in d.page_source.lower()
+# ─── cookies / login  (single fixed file) ──────────────────────────
+COOKIE_FILE = (Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()) \
+              / "emmarose0012_gmail_com.pkl"
 
-def _load_cookies(d:Chrome,email:str)->bool:
-    fp=_cookie_path(email); 
-    if not fp.exists(): return False
-    with fp.open("rb") as fh: cookies=pickle.load(fh)
-    d.get("https://gmatclub.com/forum/");  [d.add_cookie(c) for c in cookies]; d.refresh(); 
-    return _is_logged_in(d)
+def _is_logged_in(drv: Chrome) -> bool:
+    return "logout" in drv.page_source.lower()
 
-def _save_cookies(d:Chrome,email:str): _cookie_path(email).write_bytes(pickle.dumps(d.get_cookies()))
+def _load_cookies(drv: Chrome) -> bool:
+    """Return True ⇢ cookies existed *and* we end up logged-in."""
+    if not COOKIE_FILE.exists():
+        return False
+    # 1️⃣ open the domain first so add_cookie will accept them
+    drv.get("https://gmatclub.com/forum/")
+    time.sleep(1.2)
+    for c in pickle.loads(COOKIE_FILE.read_bytes()):
+        try:
+            drv.add_cookie(c)
+        except Exception:
+            pass    # skip expired / incompatible cookies
+    drv.refresh()
+    time.sleep(1.5)
+    ok = _is_logged_in(drv)
+    LOG.info("cookies loaded -> logged-in: %s", ok)
+    return ok
 
-def _login(d:Chrome,email:str,pw:str,timeout:int=30):
-    d.get("https://gmatclub.com/forum/ucp.php?mode=login")
-    WebDriverWait(d,timeout).until(EC.presence_of_element_located((By.NAME,"username")))
-    d.find_element(By.NAME,"username").send_keys(email)
-    d.find_element(By.NAME,"password").send_keys(pw)
-    d.find_element(By.NAME,"login").click()
-    time.sleep(5)
-    if "Just a moment" in d.title: input("Solve CAPTCHA then Enter → ")
-    if not WebDriverWait(d,timeout).until(lambda x:_is_logged_in(x)): raise ScrapeError("Login failed")
-    _save_cookies(d,email)
+def _save_cookies(drv: Chrome):
+    COOKIE_FILE.write_bytes(pickle.dumps(drv.get_cookies()))
+    LOG.info("✅ cookies saved → %s", COOKIE_FILE)
+
+def _login(drv: Chrome, email: str, pw: str, timeout: int = 30):
+    """Manual login (one-time); saves cookies for future runs."""
+    drv.get("https://gmatclub.com/forum/ucp.php?mode=login")
+    WebDriverWait(drv, timeout).until(EC.presence_of_element_located((By.NAME, "username")))
+    drv.find_element(By.NAME, "username").send_keys(email)
+    drv.find_element(By.NAME, "password").send_keys(pw)
+    drv.find_element(By.NAME, "login").click()
+    time.sleep(4)                          # Cloudflare / redirect
+
+    if "just a moment" in drv.title.lower():
+        input("⚠️  Solve CAPTCHA in the browser, then press <ENTER> here…")
+
+    if not WebDriverWait(drv, timeout).until(lambda d: _is_logged_in(d)):
+        raise ScrapeError("Login failed – check credentials")
+    _save_cookies(drv)
+
 
 # ─── basic cleaner (whitespace only) ────────────────────────────────
 def basic_clean(t:str)->str: return re.sub(r"\\s+"," ", t.replace("\\r"," ").replace("\\n"," ")).strip()
@@ -139,28 +129,34 @@ def _polish(d:QuestionData,q:QuestionType)->QuestionData:
         LOG.warning("Polish failed"); return d
 
 # ─── helpers --------------------------------------------------------
-def _split_opts(raw: str):
+def _split_opts(raw: str) -> tuple[str, dict[str, str]]:
     """
-    Extract answer choices written as
-    (A) text   or   A- text   or   A) text   or   (A). text
-    Returns (stem, options_dict)
+    Works for
+        (A) text   •  A- text   •  A) text   •  (A). text
+    Returns (stem, {"A": ..., "B": ...})
     """
-    # ▼ find every A/B/C… designator – several possible syntaxes
-    pattern = r"(?:\(|^)\s*([A-E])[\)\-.]"     #  (A)  or  A-  or  A)
-    locs = [(m.start(), m.group(1)) for m in re.finditer(pattern, raw, flags=re.IGNORECASE)]
-
-    if not locs:                 # nothing matched → probably no MC options
+    pattern = r"""
+        (?:^|\n|\r)            # start of line
+        [\s\(\[]*              # optional whitespace / opening bracket
+        (?P<lbl>[A-E])         # capture A-E
+        [\)\].\-–:]?           # closing ) ] . : - –
+        \s+                    # at least one space before the real text
+    """
+    matches = list(re.finditer(pattern, raw, re.I | re.VERBOSE))
+    if not matches:
         return raw.strip(), {}
 
-    stem = raw[: locs[0][0]].strip()
+    stem = raw[: matches[0].start()].strip()
     opts = {}
 
-    for i, (pos, letter) in enumerate(locs):
-        start = pos
-        end   = locs[i + 1][0] if i + 1 < len(locs) else len(raw)
-        opts[letter.upper()] = raw[start:end].lstrip("(-.)ABCDEF ").strip()
+    for i, m in enumerate(matches):
+        start = m.end()                              # ← begin **after** label/sep
+        end   = matches[i + 1].start() if i + 1 < len(matches) else len(raw)
+        label = m.group("lbl").upper()
+        opts[label] = raw[start:end].strip()
 
     return stem, opts
+
 
 
 def _open_spoiler(d:Chrome):
@@ -226,6 +222,21 @@ def _parse_multichoice(tbl) -> Dict[str, Any]:
             official = txt
     return {"choices": choices, "official": official}
 
+def _clean_opt(txt: str) -> str:
+    """
+    Strip GMAT-Club boiler-plate that sometimes gets appended
+    to the last answer choice.
+    """
+    # anything that starts a spoiler / footer
+    cut_marks = [r"\nShow\s*Answer",         #  Show\nAnswer
+                 r"\n[_]{5,}",               #  _____
+                 r"\nNew to the GMAT Club\?"]
+    for mark in cut_marks:
+        m = re.search(mark, txt, flags=re.I)
+        if m:
+            txt = txt[: m.start()]
+            break
+    return txt.strip()
 
 # ─── CR-specific option splitter ────────────────────────────────────
 def _split_opts_cr(raw: str):
@@ -247,24 +258,58 @@ def _split_opts_cr(raw: str):
     return stem, {ltr: txt.strip() for ltr, txt in zip(letters, choices)}
 
 
-# ─── CR parser ─────────────────────────────────────────────────────
+# ─── CR parser (fixed) ─────────────────────────────────────────────
+def _parse_cr(d: Chrome) -> CRDict:
+    WebDriverWait(d, 15).until(
+        EC.presence_of_element_located((By.CSS_SELECTOR, "div.item.text"))
+    )
+    raw = d.find_element(By.CSS_SELECTOR, "div.item.text").text
 
-def _parse_cr(d:Chrome)->CRDict:
-    WebDriverWait(d,15).until(EC.presence_of_element_located((By.CSS_SELECTOR,"div.item.text")))
-    raw=basic_clean(d.find_element(By.CSS_SELECTOR,"div.item.text").text)
-    stem,opts=_split_opts_cr(raw); _open_spoiler(d)
-    ans=_get_answers(d)[0] if _get_answers(d) else ""
-    return CRDict(prompt=stem,options=opts,answer=ans,difficulty=_get_difficulty(d),explanation="")
+    # 1️⃣ cut everything that follows the first “Show Spoiler”
+    raw = re.split(r"Show\s+Spoiler", raw, 1)[0]
+    raw = basic_clean(raw)
 
+    # 2️⃣ try the A- / B- splitter first; if it fails → generic splitter
+    stem, opts = _split_opts_cr(raw)
+    if not opts:
+        stem, opts = _split_opts(raw)
+        opts = {k: _clean_opt(v) for k, v in opts.items()}
+    # 3️⃣ OA & metadata
+    _open_spoiler(d)
+    ans = (_get_answers(d) or [""])[0]
+
+    return CRDict(
+        prompt      = stem,
+        options     = opts,
+        answer      = ans,
+        difficulty  = _get_difficulty(d),
+        explanation = ""
+    )
 
 
 # ─── DS parser ─────────────────────────────────────────────────────
-def _parse_ds(d:Chrome)->DSDict:
-    WebDriverWait(d,20).until(EC.presence_of_element_located((By.CSS_SELECTOR,"div.item.text")))
-    raw=basic_clean(d.find_element(By.CSS_SELECTOR,"div.item.text").text)
-    stem,opts=_split_opts(raw); _open_spoiler(d)
-    ans=_get_answers(d)[0] if _get_answers(d) else ""
-    return DSDict(question=stem,options=opts,answer=ans,difficulty=_get_difficulty(d))
+def _parse_ds(d: Chrome) -> DSDict:
+    WebDriverWait(d, 20).until(
+        EC.presence_of_element_located((By.CSS_SELECTOR, "div.item.text"))
+    )
+    raw = basic_clean(d.find_element(By.CSS_SELECTOR, "div.item.text").text)
+
+    stem, opts = _split_opts(raw)
+
+    # ── scrub each answer choice ────────────────────────────────
+    opts = {k: _clean_opt(v) for k, v in opts.items()}
+
+    _open_spoiler(d)
+    answers = _get_answers(d)
+    ans = answers[0] if answers else ""
+
+    return DSDict(
+        question   = stem,
+        options    = opts,
+        answer     = ans,
+        difficulty = _get_difficulty(d),
+    )
+
 
 # ─── RC parser ─────────────────────────────────────────────────────
 def _parse_rc(d: Chrome) -> RCDict:
@@ -314,22 +359,18 @@ def _parse_rc(d: Chrome) -> RCDict:
 
 # ─── PS parser ──────────────────────────────────────────────────────
 def _parse_ps(d: Chrome) -> DSDict:
-    """
-    GMAT PS threads have the same structure as DS:
-      • the complete statement + answer choices sit in  div.item.text
-      • the OA is hidden under the first spoiler
-      • difficulty tag is identical
-    We can therefore re-use the DS logic verbatim.
-    """
-    WebDriverWait(d, 15).until(
+    WebDriverWait(d, 20).until(
         EC.presence_of_element_located((By.CSS_SELECTOR, "div.item.text"))
     )
-
     raw = basic_clean(d.find_element(By.CSS_SELECTOR, "div.item.text").text)
-    stem, opts = _split_opts(raw)           # <-- already works for (A)…(E)
+    stem, opts = _split_opts(raw)
 
-    _open_spoiler(d)                        # reveal the OA
-    ans = _get_answers(d)[0] if _get_answers(d) else ""
+    # ── scrub each answer choice ────────────────────────────────
+    opts = {k: _clean_opt(v) for k, v in opts.items()}
+
+    _open_spoiler(d)
+    answers = _get_answers(d)
+    ans = answers[0] if answers else ""
 
     return DSDict(
         question   = stem,
@@ -337,6 +378,7 @@ def _parse_ps(d: Chrome) -> DSDict:
         answer     = ans,
         difficulty = _get_difficulty(d),
     )
+
 
 # ─── GRAPHS parser ─────────────────────────────────────────────────
 def _parse_graphs(d: Chrome) -> GraphDict:
@@ -562,27 +604,34 @@ PARSERS:Dict[QuestionType,Callable[[Chrome],QuestionData]]={
     QuestionType.GRAPHS: _parse_graphs, QuestionType.TABLES:_parse_tables
 }
 
-def scrape(*, url:str, q_type:QuestionType, email:str, password:str,
-           headless:bool=True, polish:bool=False, retries:int=1)->QuestionData:
-    for att in range(retries+1):
+def scrape(*, url: str, q_type: QuestionType,
+           email: str, password: str,
+           headless: bool = True, polish: bool = False, retries: int = 1
+           ) -> QuestionData:
+    for attempt in range(retries + 1):
         try:
             with get_driver(headless=headless) as drv:
-                if not _load_cookies(drv,email): _login(drv,email,password)
-                time.sleep(random.uniform(2,4)); drv.get(url)
-                data=PARSERS[q_type](drv)
-                return _polish(data,q_type) if polish else data
-        except (TimeoutException,ScrapeError) as e:
-            if att==retries: raise
-            LOG.warning("Retry %s due to %s", att+1, e)
+                if not _load_cookies(drv):
+                    _login(drv, email, password)
+                time.sleep(random.uniform(1.5, 3.0))
+                drv.get(url)
+                data = PARSERS[q_type](drv)
+                return _polish(data, q_type) if polish else data
+        except (TimeoutException, ScrapeError) as e:
+            if attempt == retries:
+                raise
+            LOG.warning("retry %s because %s", attempt + 1, e)
 
-# ─── smoke-test (edit URL & creds) ────────────────────────────────
-
-res = scrape(
-    url="https://gmatclub.com/forum/in-september-1997-philadelphia-s-long-time-commercial-classical-443320.html",
-    q_type=QuestionType.MSR,
-    email="emmarose0012@gmail.com", password="Sayan@123",
-    headless=False, polish=False
-)
-print(json.dumps(res, indent=2, ensure_ascii=False))
+# ─── quick smoke-test ───────────────────────────────────────────────
+if __name__ == "__main__":
+    res = scrape(
+        url="https://gmatclub.com/forum/the-majority-of-successful-senior-managers-do-not-closely-119740.html",
+        q_type=QuestionType.RC,
+        email="emmarose0012@gmail.com",
+        password="Sayan@123",
+        headless=False,
+        polish=False,
+    )
+    print(json.dumps(res, indent=2, ensure_ascii=False))
 
 # ░░░  end cell ░░░
